@@ -1,97 +1,137 @@
 import requests
-import re
+from bs4 import BeautifulSoup
+import json
 from datetime import datetime
-from typing import List, Dict, Any
 
-def get_cira_active_storms(index_url: str) -> List[Dict[str, Any]]:
+# --- 1. CONFIGURATION ---
+RAMMB_INDEX_URL = "https://rammb-data.cira.colostate.edu/tc_realtime/current_cyclones.asp"
+
+# --- 2. HELPER FUNCTIONS ---
+
+def get_active_storms():
     """
-    Scrapes the RAMMB/CIRA TC Realtime index page to get all active storms.
-    Returns a list of dicts: {stormId, stormName, atcf_url}
+    Scrape the RAMMB index page to get all active storms with their storm ID and name.
+    Returns a list of tuples: (storm_id, storm_name)
     """
-    storm_list = []
+    storms = []
     try:
-        response = requests.get(index_url, timeout=10)
-        response.raise_for_status()
-        html = response.text
+        r = requests.get(RAMMB_INDEX_URL, timeout=10)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        # Regex to find storm identifiers and names on the page
-        # Example: SH972026 - INVEST
-        matches = re.findall(r'(SH|AL|EP|WP|IO)\d{6,8}\s*-\s*(.*?)<', html)
-        for match in matches:
-            identifier = match[0] + match[1][:6]  # e.g., SH972026
-            name = match[1].strip()
-            # Construct ATCF URL
-            atcf_url = f"https://rammb-data.cira.colostate.edu/tc_realtime/products/{datetime.utcnow().year}/{identifier}/atcf/{identifier}_atcf.txt"
-            storm_list.append({
-                "stormId": identifier,
-                "stormName": name,
-                "atcf_url": atcf_url
-            })
+        # The active storms are in <a> tags linking to storm pages
+        # Example: <a href="storm.asp?storm_identifier=sh972026">SH972026 - INVEST</a>
+        for a in soup.find_all("a", href=True):
+            href = a['href']
+            if "storm_identifier=" in href:
+                storm_id = href.split("storm_identifier=")[1].upper()
+                storm_name = a.text.split("-")[-1].strip()
+                storms.append((storm_id, storm_name))
     except Exception as e:
-        print(f"Error scraping RAMMB index page: {e}")
+        print(f"❌ Failed to fetch active storms: {e}")
     
-    return storm_list
+    return storms
 
-def parse_atcf_text(url: str, stormId: str, stormName: str) -> List[Dict[str, Any]]:
+def get_storm_data(storm_id, storm_name):
     """
-    Fetches the ATCF text file and extracts the latest fix.
-    Returns as GeoJSON Feature.
+    Scrape an individual storm page to extract coordinates, max wind, and advisory time.
+    Returns a GeoJSON Feature dictionary.
     """
-    features = []
+    storm_url = f"https://rammb-data.cira.colostate.edu/tc_realtime/storm.asp?storm_identifier={storm_id}"
     try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        lines = resp.text.strip().splitlines()
+        r = requests.get(storm_url, timeout=10)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        for line in reversed(lines):
-            parts = [p.strip() for p in line.split(',')]
-            if len(parts) >= 10 and parts[4] in ["ADJ","FIX","BEST"]:
+        # Find lat/lon table or info; RAMMB pages usually include something like:
+        # <b>Latitude:</b> 15.0 N<br><b>Longitude:</b> 120.5 E<br><b>Max Wind:</b> 65 kt<br><b>Advisory Time:</b> 2025-11-15 06:00 UTC
+        text = soup.get_text(separator="\n")
+        
+        lat, lon, max_wind, advisory_time = 0, 0, 0, datetime.utcnow().isoformat() + "Z"
+
+        for line in text.split("\n"):
+            line = line.strip()
+            if line.lower().startswith("latitude:"):
                 try:
-                    lat_str = parts[6]
-                    lon_str = parts[7]
-                    max_wind = int(parts[8]) if parts[8].isdigit() else 0
-                    time_str = parts[2]
-                    # Convert lat/lon
-                    lat = float(lat_str[:-1])/10.0 * (-1 if lat_str[-1]=='S' else 1)
-                    lon = float(lon_str[:-1])/10.0 * (-1 if lon_str[-1]=='W' else 1)
-                    advisory_time = datetime.strptime(time_str, '%Y%m%d%H').isoformat() + "Z"
-
-                    feature = {
-                        "type": "Feature",
-                        "geometry": {"type": "Point", "coordinates": [lon, lat]},
-                        "properties": {
-                            "stormId": stormId,
-                            "stormName": stormName,
-                            "maxWindKts": max_wind,
-                            "advisoryTime": advisory_time,
-                            "source_agency": "CIRA_RAMMB"
-                        }
-                    }
-                    features.append(feature)
-                    break
+                    value, hemi = line.split(":")[1].strip().split()
+                    lat = float(value)
+                    if hemi.upper() == "S":
+                        lat *= -1
                 except:
                     continue
-    except Exception as e:
-        print(f"Error fetching/parsing ATCF for {stormName}: {e}")
-    return features
+            elif line.lower().startswith("longitude:"):
+                try:
+                    value, hemi = line.split(":")[1].strip().split()
+                    lon = float(value)
+                    if hemi.upper() == "W":
+                        lon *= -1
+                except:
+                    continue
+            elif line.lower().startswith("max wind:"):
+                try:
+                    max_wind = int(line.split(":")[1].strip().split()[0])
+                except:
+                    continue
+            elif line.lower().startswith("advisory time:"):
+                try:
+                    advisory_time = datetime.strptime(
+                        line.split(":")[1].strip(), "%Y-%m-%d %H:%M %Z"
+                    ).isoformat() + "Z"
+                except:
+                    continue
 
-def combine_all_data(AGENCY_CONFIG: dict) -> dict:
+        feature = {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": {
+                "stormId": storm_id,
+                "stormName": storm_name,
+                "maxWindKts": max_wind,
+                "advisoryTime": advisory_time,
+                "source_agency": "RAMMB CIRA"
+            }
+        }
+        return feature
+
+    except Exception as e:
+        print(f"❌ Failed to fetch storm data for {storm_name} ({storm_id}): {e}")
+        return {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [0, 0]},
+            "properties": {
+                "stormId": storm_id,
+                "stormName": storm_name + " - NO DATA",
+                "maxWindKts": 0,
+                "advisoryTime": datetime.utcnow().isoformat() + "Z",
+                "source_agency": "RAMMB CIRA"
+            }
+        }
+
+# --- 3. AGGREGATION ---
+
+def get_all_rammb_storms():
     """
-    Main function to fetch and combine all storms.
+    Fetches all active RAMMB storms and returns a GeoJSON FeatureCollection
     """
-    all_features = []
-    for agency, details in AGENCY_CONFIG.items():
-        if details['format'] == "CIRA_SCRAPE":
-            storms = get_cira_active_storms(details['url'])
-            for s in storms:
-                features = parse_atcf_text(s['atcf_url'], s['stormId'], s['stormName'])
-                all_features.extend(features)
-    return {
+    features = []
+    storms = get_active_storms()
+    print(f"Found {len(storms)} active storm(s).")
+    for storm_id, storm_name in storms:
+        feature = get_storm_data(storm_id, storm_name)
+        features.append(feature)
+    
+    geojson = {
         "type": "FeatureCollection",
         "metadata": {
             "updated_at": datetime.utcnow().isoformat() + "Z",
-            "total_features": len(all_features),
+            "total_features": len(features),
             "source_type": "RAMMB CIRA Live TC Feed"
         },
-        "features": all_features
+        "features": features
     }
+    return geojson
+
+# --- 4. EXECUTION (for testing) ---
+if __name__ == "__main__":
+    data = get_all_rammb_storms()
+    print(json.dumps(data, indent=2))
