@@ -3,152 +3,95 @@ import re
 from datetime import datetime
 from typing import List, Dict, Any
 
-CIRA_BASE_URL = "https://rammb-data.cira.colostate.edu/tc_realtime/"
-
-# --- 1. SCRAPE ACTIVE STORMS ---
-
-def get_cira_active_storms(index_url: str) -> List[tuple]:
+def get_cira_active_storms(index_url: str) -> List[Dict[str, Any]]:
     """
-    Scrape the RAMMB TC Realtime page for active storms.
-    Returns a list of tuples: (storm_identifier, storm_name)
+    Scrapes the RAMMB/CIRA TC Realtime index page to get all active storms.
+    Returns a list of dicts: {stormId, stormName, atcf_url}
     """
     storm_list = []
     try:
         response = requests.get(index_url, timeout=10)
         response.raise_for_status()
-        html_content = response.text
+        html = response.text
 
-        # Match lines like: SH972026 - INVEST
-        pattern = re.compile(r'([A-Z]{2}\d{6})\s*-\s*(\w+)')
-        matches = pattern.findall(html_content)
-
-        for identifier, name in matches:
-            storm_list.append((identifier, name))
-
+        # Regex to find storm identifiers and names on the page
+        # Example: SH972026 - INVEST
+        matches = re.findall(r'(SH|AL|EP|WP|IO)\d{6,8}\s*-\s*(.*?)<', html)
+        for match in matches:
+            identifier = match[0] + match[1][:6]  # e.g., SH972026
+            name = match[1].strip()
+            # Construct ATCF URL
+            atcf_url = f"https://rammb-data.cira.colostate.edu/tc_realtime/products/{datetime.utcnow().year}/{identifier}/atcf/{identifier}_atcf.txt"
+            storm_list.append({
+                "stormId": identifier,
+                "stormName": name,
+                "atcf_url": atcf_url
+            })
     except Exception as e:
-        print(f"❌ Error scraping CIRA index: {e}")
-
-    print(f"Found {len(storm_list)} active storm(s).")
+        print(f"Error scraping RAMMB index page: {e}")
+    
     return storm_list
 
-# --- 2. PARSE ATCF FIX ---
-
-def parse_atcf_text(data_text: str, identifier: str, storm_name: str) -> List[Dict[str, Any]]:
+def parse_atcf_text(url: str, stormId: str, stormName: str) -> List[Dict[str, Any]]:
     """
-    Parse ATCF text file for the latest fix.
-    Returns a list with one GeoJSON Feature.
+    Fetches the ATCF text file and extracts the latest fix.
+    Returns as GeoJSON Feature.
     """
     features = []
-    latest_fix = None
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        lines = resp.text.strip().splitlines()
 
-    for line in reversed(data_text.strip().split('\n')):
-        parts = [p.strip() for p in line.split(',')]
-        if len(parts) >= 10 and parts[2].isdigit() and parts[4] in ["ADJ", "FIX", "BEST"]:
-            try:
-                # Max wind
-                max_wind = int(parts[8]) if parts[8].isdigit() else 0
+        for line in reversed(lines):
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 10 and parts[4] in ["ADJ","FIX","BEST"]:
+                try:
+                    lat_str = parts[6]
+                    lon_str = parts[7]
+                    max_wind = int(parts[8]) if parts[8].isdigit() else 0
+                    time_str = parts[2]
+                    # Convert lat/lon
+                    lat = float(lat_str[:-1])/10.0 * (-1 if lat_str[-1]=='S' else 1)
+                    lon = float(lon_str[:-1])/10.0 * (-1 if lon_str[-1]=='W' else 1)
+                    advisory_time = datetime.strptime(time_str, '%Y%m%d%H').isoformat() + "Z"
 
-                # Latitude
-                lat_str = parts[6]
-                lat = float(lat_str[:-1]) / 10.0
-                if lat_str.endswith('S'):
-                    lat *= -1
-
-                # Longitude
-                lon_str = parts[7]
-                lon = float(lon_str[:-1]) / 10.0
-                if lon_str.endswith('W'):
-                    lon *= -1
-
-                # Advisory time
-                time_str = parts[2]
-                advisory_time = datetime.strptime(time_str, '%Y%m%d%H').isoformat() + "Z"
-
-                latest_fix = {
-                    "type": "Feature",
-                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
-                    "properties": {
-                        "stormId": identifier,
-                        "stormName": storm_name,
-                        "maxWindKts": max_wind,
-                        "advisoryTime": advisory_time,
-                        "source_agency": "CIRA_RAMMB"
+                    feature = {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                        "properties": {
+                            "stormId": stormId,
+                            "stormName": stormName,
+                            "maxWindKts": max_wind,
+                            "advisoryTime": advisory_time,
+                            "source_agency": "CIRA_RAMMB"
+                        }
                     }
-                }
-                features.append(latest_fix)
-                break
-            except Exception:
-                continue
-
-    if not features:
-        # If no fix found, fallback feature at [0,0]
-        features.append({
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [0, 0]},
-            "properties": {
-                "stormId": identifier,
-                "stormName": storm_name + " - NO DATA",
-                "maxWindKts": 0,
-                "advisoryTime": datetime.utcnow().isoformat() + "Z",
-                "source_agency": "CIRA_RAMMB"
-            }
-        })
-
+                    features.append(feature)
+                    break
+                except:
+                    continue
+    except Exception as e:
+        print(f"Error fetching/parsing ATCF for {stormName}: {e}")
     return features
 
-# --- 3. SCRAPE STORM DATA ---
-
-def scrape_cira_data() -> List[Dict[str, Any]]:
+def combine_all_data(AGENCY_CONFIG: dict) -> dict:
     """
-    Scrape all active storms from RAMMB/CIRA and parse latest fixes.
+    Main function to fetch and combine all storms.
     """
-    active_storms = get_cira_active_storms(CIRA_BASE_URL)
     all_features = []
-
-    for identifier, storm_name in active_storms:
-        print(f"Processing {storm_name} ({identifier})...")
-        storm_page_url = f"{CIRA_BASE_URL}storm_experimental.asp?storm_identifier={identifier}"
-        try:
-            response = requests.get(storm_page_url, timeout=10)
-            response.raise_for_status()
-            page_text = response.text
-
-            # Find the ATCF text file link
-            atcf_match = re.search(
-                r'href="(/tc_realtime/products/\d{4}/[A-Z]{2}\d{6}/atcf/[A-Z]{2}\d{6}_atcf.txt)"',
-                page_text
-            )
-            if atcf_match:
-                atcf_url = f"https://rammb-data.cira.colostate.edu{atcf_match.group(1)}"
-                atcf_response = requests.get(atcf_url, timeout=10)
-                atcf_response.raise_for_status()
-                features = parse_atcf_text(atcf_response.text, identifier, storm_name)
+    for agency, details in AGENCY_CONFIG.items():
+        if details['format'] == "CIRA_SCRAPE":
+            storms = get_cira_active_storms(details['url'])
+            for s in storms:
+                features = parse_atcf_text(s['atcf_url'], s['stormId'], s['stormName'])
                 all_features.extend(features)
-                print(f"✅ Added {len(features)} feature(s) for {storm_name}.")
-            else:
-                print(f"⚠️ No ATCF link found for {storm_name}.")
-        except Exception as e:
-            print(f"❌ Failed to fetch data for {storm_name}: {e}")
-
-    return all_features
-
-# --- 4. COMBINE INTO GEOJSON ---
-
-def combine_all_data() -> Dict[str, Any]:
-    features = scrape_cira_data()
     return {
         "type": "FeatureCollection",
         "metadata": {
             "updated_at": datetime.utcnow().isoformat() + "Z",
-            "total_features": len(features),
-            "source_type": "CIRA_RAMMB Live Tropical Cyclone Data"
+            "total_features": len(all_features),
+            "source_type": "RAMMB CIRA Live TC Feed"
         },
-        "features": features
+        "features": all_features
     }
-
-# --- 5. EXECUTE ---
-
-if __name__ == "__main__":
-    data = combine_all_data()
-    import json
-    print(json.dumps(data, indent=2))
