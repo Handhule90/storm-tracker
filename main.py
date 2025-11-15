@@ -1,36 +1,34 @@
+# main.py
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fetcher import combine_all_data
+from fastapi.responses import JSONResponse
+from fetcher import get_all_rammb_storms
 
-# Define the live RAMMB feed
-AGENCY_CONFIG = {
-    "CIRA_RAMMB": {
-        "url": "https://rammb-data.cira.colostate.edu/tc_realtime/",
-        "format": "CIRA_SCRAPE"
-    }
-}
-
-app = FastAPI(title="Metcycres API", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Metcycres API",
+    description="Live tropical cyclone data from RAMMB/CIRA",
+    version="1.0"
 )
 
-@app.get("/")
-def root():
-    return {"message": "Metcycres API is live. Visit /storms to get current tropical cyclones."}
-
-@app.get("/storms")
-def get_storms():
+@app.get("/", response_class=JSONResponse)
+async def root():
+    """
+    Root endpoint: Returns all current active tropical cyclones in GeoJSON format.
+    """
     try:
-        data = combine_all_data(AGENCY_CONFIG)
-        return data
+        data = get_all_rammb_storms()
+        return JSONResponse(content=data)
     except Exception as e:
-        return {"error": "Failed to fetch storm data", "details": str(e)}
+        return JSONResponse(
+            content={
+                "error": "Failed to fetch storm data",
+                "details": str(e)
+            },
+            status_code=500
+        )
 
 @app.get("/health")
-def health():
+async def health():
+    """
+    Simple health check endpoint.
+    """
     return {"status": "ok"}
